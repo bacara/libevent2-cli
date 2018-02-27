@@ -24,6 +24,8 @@
 #include <event2/bufferevent.h>
 #include <event2/buffer.h>
 
+static struct evconnlistener *s_listener;
+
 /***** ***** ***** ***** ***** ***** ***** *****
  *           Commands-related stuff
  ***** ***** ***** ***** ***** ***** ***** *****/
@@ -196,7 +198,6 @@ static void accept_error_cb(struct evconnlistener *listener, void *ctx)
 int main(int argc, char *argv[])
 {
 	struct event_base *evbase;
-	struct evconnlistener *listener;
 	struct sockaddr_in addr;
 
 	/* Initialize event base */
@@ -214,14 +215,21 @@ int main(int argc, char *argv[])
 	addr.sin_addr.s_addr = INADDR_ANY;
 
 	/* Set up a connection listener */
-	listener = evconnlistener_new_bind(evbase, accept_conn_cb, NULL, LEV_OPT_CLOSE_ON_FREE, -1, (const struct sockaddr *)&addr, sizeof(addr));
-	if ( listener == NULL )
+	s_listener = evconnlistener_new_bind(
+		evbase,
+		accept_conn_cb,
+		NULL,
+		LEV_OPT_CLOSE_ON_FREE | LEV_OPT_REUSEABLE,
+		1,
+		(const struct sockaddr *) &addr,
+		sizeof(addr));
+
+	if ( s_listener == NULL )
 	{
 		fprintf(stderr, "Cannot initialize evconnlistener\n");
-		return 1;
+		return;
 	}
-	evconnlistener_set_error_cb(listener, accept_error_cb);
-
+	evconnlistener_set_error_cb(s_listener, accept_error_cb);
 
 	/* Run event loop
 	 * NOTE: If no flags are needed, use event_base_dispatch().
@@ -243,7 +251,7 @@ int main(int argc, char *argv[])
 	}
 
 
-	evconnlistener_free(listener);
+	evconnlistener_free(s_listener);
 	event_base_free(evbase);
 
 	return 0;
