@@ -227,7 +227,7 @@ int main(int argc, char *argv[])
 	if ( s_listener == NULL )
 	{
 		fprintf(stderr, "Cannot initialize evconnlistener\n");
-		return;
+		return 1;
 	}
 	evconnlistener_set_error_cb(s_listener, accept_error_cb);
 
