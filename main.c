@@ -26,8 +26,10 @@
 #include <event2/listener.h>
 #include <event2/bufferevent.h>
 #include <event2/buffer.h>
+#include <event2/thread.h>
 
 static struct evconnlistener *s_listener;
+static struct event_base *s_evbase;
 
 /***** ***** ***** ***** ***** ***** ***** *****
  *                Utilities
@@ -125,8 +127,10 @@ int8_t cmd_kill(struct bufferevent *bev, int argc, char *argv[])
 {
 	struct event_base *base = bufferevent_get_base(bev);
 
-	bufferevent_free(bev);
-	event_base_loopexit(base, 0);
+	/* bufferevent_free(bev); */
+	/* event_base_loopexit(base, 0); */
+
+	event_base_loopexit(s_evbase, NULL);
 
 	return 0;
 }
@@ -216,7 +220,7 @@ static bool s_worker_continue = true;
 static void *worker_routine(void *arg)
 {
 	pthread_t *me = (pthread_t *) arg;
-	client_t *client;
+	client_t *client = NULL;
 
 	while (1)
 	{
@@ -268,6 +272,8 @@ static int8_t workers_init()
 
 static int8_t workers_shutdown()
 {
+	s_worker_continue = false;
+
 	CLIENTQUEUE_LOCK ();
 	pthread_cond_broadcast(&s_clientqueue.clientqueue_cond);
 	CLIENTQUEUE_UNLOCK ();
@@ -278,6 +284,11 @@ static int8_t workers_shutdown()
 /***** ***** ***** ***** ***** ***** ***** *****
  *            Event callbacks
  ***** ***** ***** ***** ***** ***** ***** *****/
+
+static void send_prompt(struct evbuffer *output)
+{
+	evbuffer_add_printf(output, "> ");
+}
 
 static void command_cb(struct bufferevent *bev, void *arg)
 {
@@ -332,10 +343,21 @@ static void command_cb(struct bufferevent *bev, void *arg)
 		if ( i == CMD_COUNT )
 			evbuffer_add_printf(output, "%s: unknown command\n", argv[0]);
 
+		send_prompt(output);
+
+		CLIENTQUEUE_LOCK ();
+		pthread_cond_broadcast(&s_clientqueue.clientqueue_cond);
+		CLIENTQUEUE_UNLOCK ();
+
 		free(argv);
 	}
 
 	free(line);
+}
+
+static void write_callback(struct bufferevent *bev, void *arg)
+{
+	fprintf(stderr, "call from write callback\n");
 }
 
 static void error_cb(struct bufferevent *bev, short events, void *arg)
@@ -348,7 +370,6 @@ static void error_cb(struct bufferevent *bev, short events, void *arg)
 
 static void on_accept_callback(struct evconnlistener *listener, evutil_socket_t fd, struct sockaddr *addr, int len, void *ptr)
 {
-	struct event_base *base = evconnlistener_get_base(listener);
 	struct bufferevent *bev;
 
 	client_t *client;
@@ -360,6 +381,8 @@ static void on_accept_callback(struct evconnlistener *listener, evutil_socket_t 
 	/* 	perror("Error accepting client:"); */
 	/* 	return; */
 	/* } */
+
+	fprintf(stderr, "on accept callback\n");
 
 	if ( (client = malloc(sizeof(client_t))) == NULL )
 	{
@@ -376,8 +399,11 @@ static void on_accept_callback(struct evconnlistener *listener, evutil_socket_t 
 	}
 
 	bev = bufferevent_socket_new(client->evbase, fd, BEV_OPT_CLOSE_ON_FREE);
-	bufferevent_setcb(bev, command_cb, NULL, error_cb, NULL);
+	bufferevent_setcb(bev, command_cb, write_callback, error_cb, NULL);
 	bufferevent_enable(bev, EV_READ);
+
+	struct evbuffer *output = bufferevent_get_output(bev);
+	send_prompt(output);
 
 	CLIENTQUEUE_LOCK ();
 	LL_ADD (client, s_clientqueue.waiting_clients);
@@ -397,7 +423,6 @@ static void on_accept_error_callback(struct evconnlistener *listener, void *ctx)
 
 int main(int argc, char *argv[])
 {
-	struct event_base *evbase; /* "Global" event base */
 	struct sockaddr_in addr;
 
 	/*
@@ -407,8 +432,20 @@ int main(int argc, char *argv[])
 	 *       according to documentation "totally unsafe for multithreaded use".
 	 */
 
-	evbase = event_base_new();
-	if ( evbase == NULL )
+	struct event_config *cfg;
+
+	cfg = event_config_new();
+	event_config_avoid_method(cfg, "epoll");
+	event_config_avoid_method(cfg, "poll");
+
+	if ( evthread_use_pthreads() == -1 )
+	{
+		fprintf(stderr, "cannot utilize evthread_pthread\n");
+		return 1;
+	}
+
+	s_evbase = event_base_new_with_config(cfg);
+	if ( s_evbase == NULL )
 	{
 		fprintf(stderr, "Cannot initialized event base\n");
 		return 1;
@@ -425,7 +462,7 @@ int main(int argc, char *argv[])
 
 	/* Set up a connection listener */
 	s_listener = evconnlistener_new_bind(
-		evbase,
+		s_evbase,
 		on_accept_callback,
 		NULL,
 		LEV_OPT_CLOSE_ON_FREE | LEV_OPT_REUSEABLE | LEV_OPT_THREADSAFE,
@@ -442,10 +479,12 @@ int main(int argc, char *argv[])
 
 	workers_init();
 
+	fprintf(stderr, "just before loop()\n");
+
 	/* Run event loop
 	 * NOTE: If no flags are needed, use event_base_dispatch().
 	 */
-	switch ( event_base_loop(evbase, EVLOOP_NO_EXIT_ON_EMPTY) )
+	switch ( event_base_loop(s_evbase, EVLOOP_NO_EXIT_ON_EMPTY) )
 	{
 		case -1:
 			fprintf(stderr, "Event base loop exit: error happened in libevent backend\n");
@@ -463,7 +502,7 @@ int main(int argc, char *argv[])
 
 	workers_shutdown();
 	evconnlistener_free(s_listener);
-	event_base_free(evbase);
+	event_base_free(s_evbase);
 
 	return 0;
 }
