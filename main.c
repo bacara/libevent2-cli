@@ -16,8 +16,10 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include <event2/event.h>
 #include <event2/listener.h>
@@ -25,6 +27,23 @@
 #include <event2/buffer.h>
 
 static struct evconnlistener *s_listener;
+
+/***** ***** ***** ***** ***** ***** ***** *****
+ *                Utilities
+ ***** ***** ***** ***** ***** ***** ***** *****/
+
+#define LL_ADD(item, list) { \
+	item->prev = NULL; \
+	item->next = list; \
+	list = item; \
+}
+
+#define LL_REMOVE(item, list) { \
+	if (item->prev != NULL) item->prev->next = item->next; \
+	if (item->next != NULL) item->next->prev = item->prev; \
+	if (list == item) list = item->next; \
+	item->prev = item->next = NULL; \
+}
 
 /***** ***** ***** ***** ***** ***** ***** *****
  *           Commands-related stuff
@@ -106,6 +125,15 @@ int8_t cmd_kill(struct bufferevent *bev, int argc, char *argv[])
 }
 
 /***** ***** ***** ***** ***** ***** ***** *****
+ *                Workqueue
+ ***** ***** ***** ***** ***** ***** ***** *****/
+
+static struct
+{
+	struct 
+} s_workqueue;
+
+/***** ***** ***** ***** ***** ***** ***** *****
  *            Event callbacks
  ***** ***** ***** ***** ***** ***** ***** *****/
 
@@ -179,7 +207,9 @@ static void error_cb(struct bufferevent *bev, short events, void *arg)
 static void accept_conn_cb(struct evconnlistener *listener, evutil_socket_t fd, struct sockaddr *addr, int len, void *ptr)
 {
 	struct event_base *base = evconnlistener_get_base(listener);
-	struct bufferevent *bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+	struct bufferevent *bev;
+
+	bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
 
 	bufferevent_setcb(bev, command_cb, NULL, error_cb, NULL);
 	bufferevent_enable(bev, EV_READ);
@@ -197,10 +227,16 @@ static void accept_error_cb(struct evconnlistener *listener, void *ctx)
 
 int main(int argc, char *argv[])
 {
-	struct event_base *evbase;
+	struct event_base *evbase; /* "Global" event base */
 	struct sockaddr_in addr;
 
-	/* Initialize event base */
+	/*
+	 * Event base initialization
+	 *
+	 * NOTE: Do NOT use event_init() anymore, as it is now deprecated and
+	 *       according to documentation "totally unsafe for multithreaded use".
+	 */
+
 	evbase = event_base_new();
 	if ( evbase == NULL )
 	{
@@ -208,7 +244,10 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	/* Initialize socket address */
+	/*
+	 * Event connection listener initialization
+	 */
+
 	bzero(&addr, sizeof(struct sockaddr_in));
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(1337);
@@ -217,10 +256,10 @@ int main(int argc, char *argv[])
 	/* Set up a connection listener */
 	s_listener = evconnlistener_new_bind(
 		evbase,
-		accept_conn_cb,
+		on_accept_callback,
 		NULL,
 		LEV_OPT_CLOSE_ON_FREE | LEV_OPT_REUSEABLE,
-		1,
+		-1,
 		(const struct sockaddr *) &addr,
 		sizeof(addr));
 
@@ -229,7 +268,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Cannot initialize evconnlistener\n");
 		return 1;
 	}
-	evconnlistener_set_error_cb(s_listener, accept_error_cb);
+	evconnlistener_set_error_cb(s_listener, on_accept_error_callback);
 
 	/* Run event loop
 	 * NOTE: If no flags are needed, use event_base_dispatch().
