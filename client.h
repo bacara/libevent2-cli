@@ -11,6 +11,9 @@ typedef struct client_s
 	struct event_base *evbase;
 	struct bufferevent *bev;
 	struct evbuffer *output;
+
+	struct client_s *prev;
+	struct client_s *next;
 } client_t;
 
 void client_close(client_t *c);

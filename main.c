@@ -20,6 +20,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include <event2/event.h>
 #include <event2/listener.h>
@@ -106,7 +107,9 @@ int8_t cmd_info(struct bufferevent *bev, int argc, char *argv[])
 	evbuffer_add_printf(output, "\
 Here are some information. You might find them useful or not (surely not), but\
  the fact is we kept our promise. You have information by typing the \"info\"\
-command in here.\n");
+command in here.\n\
+\n\
+This is coming from thread 0x%x !\n", (int) pthread_self());
 
 	return 0;
 }
@@ -114,6 +117,8 @@ command in here.\n");
 int8_t cmd_quit(struct bufferevent *bev, int argc, char *argv[])
 {
 	bufferevent_free(bev);
+
+	return 0;
 }
 
 int8_t cmd_kill(struct bufferevent *bev, int argc, char *argv[])
@@ -122,16 +127,153 @@ int8_t cmd_kill(struct bufferevent *bev, int argc, char *argv[])
 
 	bufferevent_free(bev);
 	event_base_loopexit(base, 0);
+
+	return 0;
 }
 
 /***** ***** ***** ***** ***** ***** ***** *****
- *                Workqueue
+ *                Client queue
+ ***** ***** ***** ***** ***** ***** ***** *****/
+
+typedef struct client_s
+{
+	int fd;
+	struct event_base *evbase;
+	struct bufferevent *bev;
+	struct evbuffer *output;
+
+	struct client_s *prev;
+	struct client_s *next;
+} client_t;
+
+static void client_close(client_t *client)
+{
+	if ( client == NULL )
+		return;
+
+	if ( client->fd >= 0 )
+	{
+		if ( close(client->fd) )
+			/* TODO: Handle errors from close() */ ;
+		client->fd = -1;
+	}
+}
+
+static void client_free(client_t *client)
+{
+	if ( client == NULL )
+		return;
+
+	/*
+	 * Free event buffers and base
+	 */
+	if ( client->output != NULL )
+	{
+		evbuffer_free(client->output);
+		client->output = NULL;
+	}
+	if ( client->bev != NULL )
+	{
+		bufferevent_free(client->bev);
+		client->bev = NULL;
+	}
+	if ( client->evbase != NULL )
+	{
+		event_base_free(client->evbase);
+		client->evbase = NULL;
+	}
+
+	/* Free application-specific data */
+
+	/* Free client structure */
+	free(client);
+}
+
+/***** ***** ***** ***** ***** ***** ***** *****
+ *                Client queue
  ***** ***** ***** ***** ***** ***** ***** *****/
 
 static struct
 {
-	struct 
-} s_workqueue;
+	client_t *waiting_clients;
+
+	pthread_mutex_t clientqueue_mutex;
+	pthread_cond_t  clientqueue_cond;
+} s_clientqueue;
+
+#define CLIENTQUEUE_LOCK()   pthread_mutex_lock(&s_clientqueue.clientqueue_mutex);
+#define CLIENTQUEUE_UNLOCK() pthread_mutex_unlock(&s_clientqueue.clientqueue_mutex);
+
+/***** ***** ***** ***** ***** ***** ***** *****
+ *                Workers
+ ***** ***** ***** ***** ***** ***** ***** *****/
+
+#define NWORKERS 4
+
+static pthread_t s_workers[NWORKERS];
+static bool s_worker_continue = true;
+
+static void *worker_routine(void *arg)
+{
+	pthread_t *me = (pthread_t *) arg;
+	client_t *client;
+
+	while (1)
+	{
+		CLIENTQUEUE_LOCK ();
+		while ( s_clientqueue.waiting_clients == NULL )
+			pthread_cond_wait(&s_clientqueue.clientqueue_cond, &s_clientqueue.clientqueue_mutex);
+
+		client = s_clientqueue.waiting_clients;
+		if ( client != NULL )
+			LL_REMOVE (client, s_clientqueue.waiting_clients);
+		CLIENTQUEUE_UNLOCK ();
+
+		if ( !s_worker_continue )
+			break;
+
+		if ( client == NULL )
+			continue;
+
+		event_base_dispatch(client->evbase);
+		client_close(client);
+		client_free(client);
+	}
+
+	return NULL;
+}
+
+static int8_t workers_init()
+{
+	uint8_t i;
+
+	pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
+	pthread_cond_t  blank_cond  = PTHREAD_COND_INITIALIZER;
+
+	bzero(&s_clientqueue, sizeof(s_clientqueue));
+	memcpy(&s_clientqueue.clientqueue_mutex, &blank_mutex, sizeof(pthread_mutex_t));
+	memcpy(&s_clientqueue.clientqueue_cond,  &blank_cond,  sizeof(pthread_cond_t));
+
+	for ( i = 0; i < NWORKERS; ++i )
+	{
+		if ( pthread_create(&s_workers[i], NULL, worker_routine, (void *) &s_workers[i]) )
+		{
+			fprintf(stderr, "Failed to start all threads\n");
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int8_t workers_shutdown()
+{
+	CLIENTQUEUE_LOCK ();
+	pthread_cond_broadcast(&s_clientqueue.clientqueue_cond);
+	CLIENTQUEUE_UNLOCK ();
+
+	return 0;
+}
 
 /***** ***** ***** ***** ***** ***** ***** *****
  *            Event callbacks
@@ -204,18 +346,46 @@ static void error_cb(struct bufferevent *bev, short events, void *arg)
 		bufferevent_free(bev);
 }
 
-static void accept_conn_cb(struct evconnlistener *listener, evutil_socket_t fd, struct sockaddr *addr, int len, void *ptr)
+static void on_accept_callback(struct evconnlistener *listener, evutil_socket_t fd, struct sockaddr *addr, int len, void *ptr)
 {
 	struct event_base *base = evconnlistener_get_base(listener);
 	struct bufferevent *bev;
 
-	bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+	client_t *client;
 
+	/* int c_fd = accept(fd, NULL, NULL); */
+
+	/* if ( c_fd == -1 ) */
+	/* { */
+	/* 	perror("Error accepting client:"); */
+	/* 	return; */
+	/* } */
+
+	if ( (client = malloc(sizeof(client_t))) == NULL )
+	{
+		fprintf(stderr, "Client structure allocation failed\n");
+		return;
+	}
+	bzero(client, sizeof(client_t));
+	client->fd = fd;
+
+	if ( (client->evbase = event_base_new()) == NULL )
+	{
+		fprintf(stderr, "Client event base init failed\n");
+		return;
+	}
+
+	bev = bufferevent_socket_new(client->evbase, fd, BEV_OPT_CLOSE_ON_FREE);
 	bufferevent_setcb(bev, command_cb, NULL, error_cb, NULL);
 	bufferevent_enable(bev, EV_READ);
+
+	CLIENTQUEUE_LOCK ();
+	LL_ADD (client, s_clientqueue.waiting_clients);
+	pthread_cond_broadcast(&s_clientqueue.clientqueue_cond);
+	CLIENTQUEUE_UNLOCK ();
 }
 
-static void accept_error_cb(struct evconnlistener *listener, void *ctx)
+static void on_accept_error_callback(struct evconnlistener *listener, void *ctx)
 {
 	struct event_base *base = evconnlistener_get_base(listener);
 	int err = EVUTIL_SOCKET_ERROR();
@@ -258,7 +428,7 @@ int main(int argc, char *argv[])
 		evbase,
 		on_accept_callback,
 		NULL,
-		LEV_OPT_CLOSE_ON_FREE | LEV_OPT_REUSEABLE,
+		LEV_OPT_CLOSE_ON_FREE | LEV_OPT_REUSEABLE | LEV_OPT_THREADSAFE,
 		-1,
 		(const struct sockaddr *) &addr,
 		sizeof(addr));
@@ -269,6 +439,8 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 	evconnlistener_set_error_cb(s_listener, on_accept_error_callback);
+
+	workers_init();
 
 	/* Run event loop
 	 * NOTE: If no flags are needed, use event_base_dispatch().
@@ -289,7 +461,7 @@ int main(int argc, char *argv[])
 			break;
 	}
 
-
+	workers_shutdown();
 	evconnlistener_free(s_listener);
 	event_base_free(evbase);
 
